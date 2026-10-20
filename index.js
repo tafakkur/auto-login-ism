@@ -1,34 +1,107 @@
 import puppeteer from "puppeteer";
 import dotenv from "dotenv";
-import https from "https";
 
 // Load environment variables
 dotenv.config();
 
-const TEST_URL = "https://www.google.com"; // Used to check internet connection
-const LDAP_URL = process.env.PUPPETEER_LDAP_URL;
+// Add timestamps to console output
+const originalLog = console.log;
+console.log = function (...args) {
+	originalLog(`[${new Date().toLocaleString()}]`, ...args);
+};
+const originalError = console.error;
+console.error = function (...args) {
+	originalError(`[${new Date().toLocaleString()}]`, ...args);
+};
+
+const LDAP_URL = process.env.LDAP_URL || process.env.PUPPETEER_LDAP_URL || "https://netaccess.iitism.ac.in:6082/";
 const LDAP_USERNAME = process.env.LDAP_USERNAME;
 const LDAP_PASSWORD = process.env.LDAP_PASSWORD;
 
-function hasInternetConnection() {
-	return new Promise((resolve) => {
-		const req = https.get(TEST_URL, (res) => {
-			resolve(true);
-		});
-		req.on("error", (err) => {
-			resolve(false);
-		});
-		req.setTimeout(1000, () => {
-			req.destroy();
-			resolve(false);
-		});
-	});
+/**
+ * Tests if the internet is working or not by navigating to Google.
+ */
+async function testInternet(page) {
+	console.log("Testing internet connection by visiting google.com...");
+	try {
+		await page.goto("https://www.google.com", { waitUntil: "networkidle2", timeout: 10000 });
+		const url = page.url();
+		// If the URL remains google.com, we have internet
+		if (url.includes("google.com")) {
+			console.log("Internet is working fine.");
+			return true;
+		}
+		console.log(`No internet. Redirected to: ${url}`);
+		return false;
+	} catch (e) {
+		console.log(`Failed to load Google: ${e.message}`);
+		return false;
+	}
 }
 
-async function loginToLdap() {
-	if (!LDAP_URL) {
-		throw new Error("PUPPETEER_LDAP_URL is not set in your environment.");
+/**
+ * Navigates to the LDAP URL and handles the 'Already Connected' state.
+ */
+async function goToLoginPage(page, ldapUrl) {
+	console.log(`Navigating to LDAP login page: ${ldapUrl}`);
+	await page.goto(ldapUrl, { waitUntil: "networkidle0" });
+
+	// Check if the portal thinks we are already logged in
+	const isAlreadyLoggedIn = await page.evaluate(() => {
+		return document.body.innerText.includes("Already Connected") || !!document.querySelector(".btn-logout");
+	});
+
+	if (isAlreadyLoggedIn) {
+		console.log("Portal says 'Already Connected' but internet check failed. Forcing re-login...");
+		const reloginUrl = new URL("/portal/relogin", page.url()).href;
+		await page.goto(reloginUrl, { waitUntil: "networkidle0" });
 	}
+}
+
+/**
+ * Enters the login credentials at the LDAP URL page and submits.
+ */
+async function enterCreds(page, username, password) {
+	console.log("Entering credentials...");
+
+	// Wait for and fill the username field
+	await page.waitForSelector('input[name="username"], input[type="text"]', { timeout: 10000 });
+	const usernameInputs = await page.$$('input[name="username"], input[type="text"]');
+	if (usernameInputs.length > 0) {
+		await usernameInputs[0].type(username);
+	}
+
+	// Wait for and fill the password field
+	const passwordInputs = await page.$$('input[name="password"], input[type="password"]');
+	if (passwordInputs.length > 0) {
+		await passwordInputs[0].type(password);
+	}
+
+	// Attempt to click the submit button
+	const submitBtns = await page.$$('button[type="submit"], input[type="submit"]');
+	let clicked = false;
+	for (const btn of submitBtns) {
+		await btn.click();
+		clicked = true;
+		break;
+	}
+
+	if (!clicked) {
+		// Fallback: press Enter if no button found
+		await page.keyboard.press("Enter");
+	}
+
+	console.log("Waiting for login to complete...");
+	await new Promise((res) => setTimeout(res, 5000));
+}
+
+async function main() {
+	if (!LDAP_USERNAME || !LDAP_PASSWORD) {
+		console.error("Please set LDAP_USERNAME and LDAP_PASSWORD in your .env file.");
+		return;
+	}
+
+	console.log("Starting background browser...");
 	const browser = await puppeteer.launch({
 		headless: true,
 		ignoreHTTPSErrors: true,
@@ -37,39 +110,57 @@ async function loginToLdap() {
 			"--disable-setuid-sandbox",
 			"--ignore-certificate-errors",
 			"--disable-web-security",
-			"--disable-features=IsolateOrigins,site-per-process"
-		]
+			"--disable-features=IsolateOrigins,site-per-process",
+		],
 	});
-	const page = await browser.newPage();
+
 	try {
-		await page.goto(TEST_URL, { waitUntil: "networkidle0" });
+		const page = await browser.newPage();
+		let attempts = 0;
 
-		// TODO: Update selectors below to match your LDAP login page
-		await page.type('input[name="username"]', LDAP_USERNAME);
-		await page.type('input[name="password"]', LDAP_PASSWORD);
-		await page.click('button[type="submit"]');
+		while (true) {
+			attempts++;
+			console.log(`[Attempt #${attempts}] Checking internet connection...`);
 
-		// Wait for navigation or success indication
-		await page.waitForTimeout(5000);
-		await browser.close();
+			const isConnected = await testInternet(page);
+			if (isConnected) {
+				console.log("Internet is active! Exiting process.");
+				break;
+			}
+
+			console.log("Internet is down. Attempting LDAP login workflow...");
+
+			try {
+				await goToLoginPage(page, LDAP_URL);
+				await enterCreds(page, LDAP_USERNAME, LDAP_PASSWORD);
+
+				// Check internet after login attempt
+				const isConnectedNow = await testInternet(page);
+				if (isConnectedNow) {
+					console.log("Success! You are now logged in and connected to the internet.");
+					break;
+				} else {
+					console.log("Login submitted, but internet is still not working. Will retry...");
+				}
+			} catch (err) {
+				console.error(`Login attempt failed: ${err.message}`);
+			}
+
+			// After every 10 tries, wait for 30 seconds
+			if (attempts % 10 === 0) {
+				console.log(`Reached ${attempts} attempts. Waiting 30 seconds before next try...`);
+				await new Promise((res) => setTimeout(res, 30000));
+			} else {
+				// Short wait before immediate retry
+				await new Promise((res) => setTimeout(res, 2000));
+			}
+		}
 	} catch (error) {
-		await page.reload({ waitUntil: "networkidle0" });
-		// TODO: Update selectors below to match your LDAP login page
-		await page.type('input[name="username"]', LDAP_USERNAME);
-		await page.type('input[name="password"]', LDAP_PASSWORD);
-		await page.click('input[type="submit"]');
-		await page.waitForTimeout(5000);
+		console.error("An unhandled error occurred during the auto-login process:", error);
+	} finally {
+		console.log("Closing browser...");
 		await browser.close();
 	}
 }
 
-const main = async () => {
-	if (await hasInternetConnection()) {
-		console.log("Internet connection is active.");
-	} else {
-		console.log("No internet connection. Attempting LDAP login...");
-		await loginToLdap();
-	}
-};
-
-await main();
+main();

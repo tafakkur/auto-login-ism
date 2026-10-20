@@ -1,0 +1,2 @@
+@reboot /home/common/Downloads/ism-internet-login.sh >> /home/common/Downloads/connection.log 2>&1
+*/5 * * * * /home/common/Downloads/ism-internet-login.sh >> /home/common/Downloads/connection.log 2>&1
